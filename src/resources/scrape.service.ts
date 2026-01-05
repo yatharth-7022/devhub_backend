@@ -1,11 +1,25 @@
+// src/resources/scrape.service.ts
+
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { Injectable, Logger } from '@nestjs/common';
 import { chromium } from 'playwright';
-import { Document } from '@langchain/core/documents';
+
+class HTMLLoader {
+  parse({ html }: { html: string }) {
+    const text = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return Promise.resolve([{ pageContent: text }]);
+  }
+}
 
 @Injectable()
 export class ScrapeService {
   private readonly logger = new Logger(ScrapeService.name);
+
   private readonly splitter = new RecursiveCharacterTextSplitter({
     chunkSize: 1000,
     chunkOverlap: 200,
@@ -14,47 +28,46 @@ export class ScrapeService {
   async scrapeAndProcess(url: string): Promise<{
     title: string;
     contentPreview: string;
+    text: string; // main extracted text
   }> {
     let browser;
     try {
-      // Use Playwright to fetch and extract content
       browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage();
+      const context = await browser.newContext({
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        viewport: { width: 1920, height: 1080 },
+      });
+
+      const page = await context.newPage();
       await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
 
+      const html = await page.content();
       const title = (await page.title()) || 'Untitled';
 
-      // Extract text content directly from the page
-      const text = await page.evaluate(() => document.body.innerText);
+      const loader = new HTMLLoader();
+      const docs = await loader.parse({ html });
 
-      await browser.close();
+      const rawText = docs
+        .map((d) => d.pageContent)
+        .join('\n')
+        .trim();
+      if (!rawText) throw new Error('No readable content found');
 
-      // Create a LangChain document from the extracted text
-      const docs = [
-        new Document({
-          pageContent: text,
-          metadata: { source: url },
-        }),
-      ];
-
-      if (docs.length === 0 || !docs[0].pageContent.trim()) {
-        throw new Error('No readable content found');
-      }
-
-      const chunks = await this.splitter.splitDocuments(docs);
-      const preview = chunks
-        .slice(0, 3)
-        .map((c) => c.pageContent)
-        .join('\n\n');
+      // We keep full text for embedding, and preview for UI
+      const chunks = await this.splitter.splitText(rawText);
+      const contentPreview = (chunks[0] ?? rawText).slice(0, 400);
 
       return {
-        title,
-        contentPreview: preview,
+        title: title.slice(0, 200),
+        contentPreview,
+        text: rawText,
       };
-    } catch (error) {
-      this.logger.error(`Scrape failed for ${url}:`, error);
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to scrape ${url}: ${message}`);
+    } catch (error: any) {
+      this.logger.error(`Scrape failed for ${url}: ${error?.message ?? error}`);
+      throw new Error(
+        `Failed to scrape ${url}: ${error?.message ?? 'Unknown error'}`,
+      );
     } finally {
       if (browser) await browser.close();
     }

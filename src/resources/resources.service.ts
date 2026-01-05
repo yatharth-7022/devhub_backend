@@ -7,6 +7,10 @@ import { CreateFromUrlDto } from './dto/create-from-url.dto';
 import { ListResourcesQueryDto } from './dto/list-resources.query.dto';
 import { PageResult } from 'src/common/pagination';
 import { Prisma } from '@prisma/client';
+import { InjectQueue } from '@nestjs/bullmq';
+import { INGEST_QUEUE, INGEST_RESOURCE_JOB } from 'src/ai/ai.constant';
+import { Queue } from 'bullmq';
+import { IngestResourceJob } from 'src/ai/types/ingest-job.type';
 
 @Injectable()
 export class ResourcesService {
@@ -14,6 +18,7 @@ export class ResourcesService {
     private readonly prisma: PrismaService,
     private readonly spacesService: SpacesService,
     private readonly scrapeService: ScrapeService,
+    @InjectQueue(INGEST_QUEUE) private readonly ingestQueue: Queue,
   ) {}
 
   async createForUser(userId: string, dto: CreateResourceDto) {
@@ -34,9 +39,8 @@ export class ResourcesService {
     // Ensure the space belongs to the user
     await this.spacesService.ensureUserOwnsSpace(userId, dto.spaceId);
 
-    const { title, contentPreview } = await this.scrapeService.scrapeAndProcess(
-      dto.url,
-    );
+    const { title, contentPreview, text } =
+      await this.scrapeService.scrapeAndProcess(dto.url);
 
     const resource = await this.prisma.resource.create({
       data: {
@@ -48,6 +52,17 @@ export class ResourcesService {
         // pineconeId = null (W3)
       },
     });
+    const payload: IngestResourceJob = {
+      resourceId: resource.id,
+      spaceId: resource.spaceId,
+      title: resource.title ?? undefined,
+      url: resource.url ?? undefined,
+      text,
+    };
+
+    // Enqueue ingestion job
+    await this.ingestQueue.add(INGEST_RESOURCE_JOB, payload);
+
     return resource;
   }
   async findBySpaceForUser(userId: string, spaceId: string) {
